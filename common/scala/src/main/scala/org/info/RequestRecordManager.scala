@@ -403,7 +403,7 @@ object ContainerRemoveManager {
     val workingContainerCount = ContainerDbInfoManager.countEntriesByState("working")
     val prewarmContainerCount = ContainerDbInfoManager.countEntriesByState("prewarm")
     
-    logging.warn(this, s"当前系统中的容器状态: loading: $loadingContainerCount, warm: $warmContainerCount, working: $workingContainerCount")
+    // logging.warn(this, s"当前系统中的容器状态: loading: $loadingContainerCount, warm: $warmContainerCount, working: $workingContainerCount")
 
 
     val dbInfo = ContainerDbInfoManager.getDbInfo()

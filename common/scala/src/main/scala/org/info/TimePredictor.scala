@@ -113,7 +113,7 @@ object TimePredictor {
   val TargetBenchmark = Tpch1gParquetSize
 
   def initWaitingTimeRecorder()(implicit logging: Logging): Unit = {
-    logging.warn(this, s"调度器考虑的容器状态列表: $ConsideredStates")
+    // logging.warn(this, s"调度器考虑的容器状态列表: $ConsideredStates")
     logging.info(this, "正在初始化等待时间记录器...")
     
     val file = new File(waitingTimeFilePath)
@@ -261,6 +261,7 @@ object TimePredictor {
 
     // val bandwidthBps: Long = (ContainerDbInfoManager.dbSizeGrowthRateMap.values.sum / ContainerDbInfoManager.dbSizeGrowthRateMap.size).toLong
 
+    logging.warn(this, s"正在计算带宽")
     val bandwidthBps: Long = {
       val calculatedBandwidth = if (ContainerDbInfoManager.dbSizeGrowthRateMap.isEmpty) {
         TimePredictor.defaultBandwidthBps
@@ -271,13 +272,16 @@ object TimePredictor {
       math.max(calculatedBandwidth, TimePredictor.defaultBandwidthBps)
     }
 
+    logging.warn(this, s"正在计算缺失表")
     // 找出缺失的表
     val missingTables = neededTables.diff(existingTables)
     
+    logging.warn(this, s"正在计算缺失表总大小")
     // 计算缺失表的总大小（字节），并转换为bit
     val totalSizeBytes = missingTables.flatMap(TargetBenchmark.get).sum
 
     // 计算并返回下载时间（秒）
+    logging.warn(this, s"计算预计下载时间完成")
     totalSizeBytes.toDouble / bandwidthBps
   }
 
@@ -411,7 +415,8 @@ object TimePredictor {
     // logging.info(this, s"dbInfo contents: $dbInfo")
 
     // 遍历 dbInfo 中的所有容器
-    val containerWaitTimes = dbInfo.flatMap {
+    // val containerWaitTimes = dbInfo.flatMap {
+    val containerWaitTimes = dbInfo.toSeq.par.flatMap {
       case (containerId, info) =>
         // 检查是否在 waitingQueue 中，如果是则跳过
         if (waitingContainerIds.contains(containerId)) {
@@ -547,7 +552,8 @@ object TimePredictor {
         None // 非 warm 或 working 状态的容器跳过 
           }
         }
-    }.toSeq
+    // }.toSeq
+    }.seq.toSeq
     containerWaitTimes
   }
 }

@@ -265,7 +265,6 @@ class ContainerManager(jobManagerFactory: ActorRefFactory => ActorRef,
   // 将调度时间追加到日志文件
   private def appendToLogFile(creationId: String, schedulingTimeMs: Long)(implicit logging: Logging): Unit = {
     val writer = new PrintWriter(new FileWriter(scheduleTimePath, true))
-    logging.error(this, s"creationId: ${creationId} 调度完成, 耗时${schedulingTimeMs}ms")
     if (schedulingTimeMs > 1000){
       logging.error(this, s"调度耗时过长！！！")
     }
@@ -510,6 +509,7 @@ class ContainerManager(jobManagerFactory: ActorRefFactory => ActorRef,
     val currentTimeMs = System.currentTimeMillis()
     msgs.foreach { msg =>
       requestTimes.put(msg.creationId.asString, currentTimeMs)
+      logging.warn(this, s"请求creationId: ${msg.creationId.asString} , 时间 $currentTimeMs")
     }
 
     // logging.info(this, s"received ${msgs.size} creation message [${msgs.head.invocationNamespace}:${msgs.head.action}]")
@@ -648,6 +648,7 @@ class ContainerManager(jobManagerFactory: ActorRefFactory => ActorRef,
             val receiveTime = requestTimes.remove(requestId)
             val currentTimeMs = System.currentTimeMillis()
             val schedulingTimeMs = currentTimeMs - receiveTime
+            logging.warn(this, s"请求creationId: ${msg.creationId.asString} 调度完成, 时间 $currentTimeMs, 耗时${schedulingTimeMs}ms")
             
             // 将调度时间写入文件，传递creationId和调度时间
             appendToLogFile(requestId, schedulingTimeMs)
@@ -969,7 +970,7 @@ object ContainerManager {
         }
 
         // 选择等待时间最短的策略，包括冷启动、warm 容器和 working 容器的等待时间
-        logging.info(this, s"为 msg creationId: ${msg.creationId.asString} 选择最佳策略...")
+        logging.warn(this, s"为 msg creationId: ${msg.creationId.asString} 选择最佳策略...")
         val optimalStrategy = TimePredictor.predictWaitTimeAndGetOptimal(msg.creationId.asString, tablesNeeded, waitingAWarmContainer)
         logging.error(this, s"${msg.creationId.asString} 选择最佳策略为 $optimalStrategy")
 
