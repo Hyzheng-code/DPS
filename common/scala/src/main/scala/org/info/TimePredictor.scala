@@ -11,7 +11,8 @@ import java.io.{File, FileWriter, PrintWriter}
 
 object TimePredictor {
   // 调度器考虑的容器状态列表
-  val ConsideredStates: List[String] = List("warm", "working", "loading", "prewarm")
+  // val ConsideredStates: List[String] = List("warm", "working", "loading", "prewarm")
+  val ConsideredStates: List[String] = List("warm", "working", "loading")
   // List() // 只有冷启动
   // List("warm", "prewarm") // 只有冷热启动
   // List("warm", "working", "loading", "prewarm") // 完全wait
@@ -261,7 +262,7 @@ object TimePredictor {
 
     // val bandwidthBps: Long = (ContainerDbInfoManager.dbSizeGrowthRateMap.values.sum / ContainerDbInfoManager.dbSizeGrowthRateMap.size).toLong
 
-    logging.warn(this, s"正在计算带宽")
+    logging.warn(this, s"${System.currentTimeMillis()}-正在计算带宽")
     val bandwidthBps: Long = {
       val calculatedBandwidth = if (ContainerDbInfoManager.dbSizeGrowthRateMap.isEmpty) {
         TimePredictor.defaultBandwidthBps
@@ -272,16 +273,16 @@ object TimePredictor {
       math.max(calculatedBandwidth, TimePredictor.defaultBandwidthBps)
     }
 
-    logging.warn(this, s"正在计算缺失表")
+    // logging.warn(this, s"${System.currentTimeMillis()}-正在计算缺失表")
     // 找出缺失的表
     val missingTables = neededTables.diff(existingTables)
     
-    logging.warn(this, s"正在计算缺失表总大小")
+    // logging.warn(this, s"${System.currentTimeMillis()}-正在计算缺失表总大小")
     // 计算缺失表的总大小（字节），并转换为bit
     val totalSizeBytes = missingTables.flatMap(TargetBenchmark.get).sum
 
     // 计算并返回下载时间（秒）
-    logging.warn(this, s"计算预计下载时间完成")
+    // logging.warn(this, s"${System.currentTimeMillis()}-计算预计下载时间完成")
     totalSizeBytes.toDouble / bandwidthBps
   }
 
@@ -316,7 +317,7 @@ object TimePredictor {
   }
 
   def predictWaitTimeAndGetOptimal(creationId: String, tablesNeeded: List[String], waitingAWarmContainer: Boolean = false)(implicit logging: Logging): (String, Double, Boolean) = synchronized {
-    logging.info(this, s"正在为creationId: $creationId 选择最佳容器")
+    logging.warn(this, s"${System.currentTimeMillis()}-正在为creationId: $creationId 选择最佳容器")
     val coldStartDownloadTime = predictDownloadTime(tablesNeeded, List.empty[String])
     val coldStartTotalTime = coldStartDownloadTime + coldStartContainerInitTime
     logging.info(this, s"Predicted total wait time for cold start: $coldStartTotalTime = coldStartDownloadTime: $coldStartDownloadTime + coldStartContainerInitTime: $coldStartContainerInitTime")
@@ -410,22 +411,31 @@ object TimePredictor {
   def predictWaitTime(tablesNeeded: List[String], waitingAWarmContainer: Boolean = false)(implicit logging: Logging): Seq[(String, Double, Boolean)] = synchronized {
     // waitingContainerIds = newWaitingContainerIds
     // 尽量后置dbInfo的读取，防止读到更新前的值
+    logging.warn(this, s"${System.currentTimeMillis()}-正在过滤容器")
     logging.info(this, s"waitingAWarmContainer: $waitingAWarmContainer")
     val dbInfo = ContainerDbInfoManager.getDbInfo()
     // logging.info(this, s"dbInfo contents: $dbInfo")
-
+    val filteredDbInfo = dbInfo.filter { case (containerId, info) =>
+      // 条件1：跳过正在被等待的容器
+      !waitingContainerIds.contains(containerId) &&
+      // 条件2：只考虑配置允许的状态
+      ConsideredStates.contains(info.state) &&
+      // 条件3：warm状态总是可以考虑
+      (info.state == "warm" ||
+      // 条件4：working状态仅在非等待已返回容器时考虑
+      (info.state == "working" && !waitingAWarmContainer) ||
+      // 条件5：loading状态需要非等待已返回容器且有有效containerId
+      (info.state == "loading" && !waitingAWarmContainer))
+    }
+    // logging.warn(this, s"filteredDbInfo contents: $filteredDbInfo")
+    logging.warn(this, s"${System.currentTimeMillis()}-过滤前容器数: ${dbInfo.size}, 过滤后容器数: ${filteredDbInfo.size}")
     // 遍历 dbInfo 中的所有容器
     // val containerWaitTimes = dbInfo.flatMap {
-    val containerWaitTimes = dbInfo.toSeq.par.flatMap {
+    val containerWaitTimes = filteredDbInfo.toSeq.par.flatMap {
       case (containerId, info) =>
-        // 检查是否在 waitingQueue 中，如果是则跳过
-        if (waitingContainerIds.contains(containerId)) {
-          logging.info(this, s"Skipping container $containerId as it is already in waitingQueue.")
-          None  // 跳过该容器
-        } else {
           // logging.info(this, s"inspect container: $containerId, it is $info.state")
           info.state match {
-            case state if state == "warm" && ConsideredStates.contains(state) =>
+            case "warm" =>
               // 对于 warm 容器，只计算缺失表的下载时间
               val existingTables = info.tables
               val warmDownloadTime = predictDownloadTime(tablesNeeded, existingTables, containerId)
@@ -433,7 +443,7 @@ object TimePredictor {
               Some((containerId, warmDownloadTime, true))
 
             // 加上if !waitingAWarmContainer，因为如果这个msg等待的容器已返回，则不再为它考虑工作中的容器，避免再次等待，影响公平性
-            case state if state == "working" && ConsideredStates.contains(state) && !waitingAWarmContainer =>
+            case "working" =>
               // 对于 working 容器，计算缺失表的下载时间和剩余运行时间
               val existingTables = info.tables
               val lackTableDownloadTime = predictDownloadTime(tablesNeeded, existingTables, containerId)
@@ -442,12 +452,11 @@ object TimePredictor {
               val elapsedTimeOpt = info.updateStateTimestamp.map { timestamp =>
                 (System.currentTimeMillis() / 1000.0) - timestamp
               }
-              val predictWorkingTimeOpt = info.predictWorkingTime
 
               // 计算 remainingWorkTime，如果有 missing 值则跳过
               (for {
                 elapsedTime <- elapsedTimeOpt
-                predictWorkingTime <- predictWorkingTimeOpt
+                predictWorkingTime <- info.predictWorkingTime
               } yield {
                 val timeLeft = predictWorkingTime - elapsedTime
                 // if (timeLeft < - 10000) {
@@ -465,17 +474,17 @@ object TimePredictor {
               None
             }
 
-            case state if state == "prewarm" && ConsideredStates.contains(state) =>
-              // 对于预热状态的容器，设置一个略低于冷启动的时间，实际上不应该是空列表
-              val existingTables = info.tables
-              val prewarmDownloadTime = predictDownloadTime(tablesNeeded, existingTables, containerId)
+            // case "prewarm" && ConsideredStates.contains(state) =>
+            //   // 对于预热状态的容器，设置一个略低于冷启动的时间，实际上不应该是空列表
+            //   val existingTables = info.tables
+            //   val prewarmDownloadTime = predictDownloadTime(tablesNeeded, existingTables, containerId)
 
-              val prewarmWaitTime = (coldStartContainerInitTime -1) + prewarmDownloadTime
-              Some((containerId, prewarmWaitTime, false))
+            //   val prewarmWaitTime = (coldStartContainerInitTime -1) + prewarmDownloadTime
+            //   Some((containerId, prewarmWaitTime, false))
 
             // 由于loading时间预测不准确，暂时注释掉不考虑
             // 通过限制containerId的长度来跳过那些刚创建、还没有containerId的条目
-            case state if state == "loading" && ConsideredStates.contains(state) && !waitingAWarmContainer && containerId.length == 64 =>
+            case "loading" =>
 
               val existingTables = info.tables
               val currentTime = Instant.now.getEpochSecond
@@ -551,7 +560,7 @@ object TimePredictor {
       case _ =>
         None // 非 warm 或 working 状态的容器跳过 
           }
-        }
+        
     // }.toSeq
     }.seq.toSeq
     containerWaitTimes

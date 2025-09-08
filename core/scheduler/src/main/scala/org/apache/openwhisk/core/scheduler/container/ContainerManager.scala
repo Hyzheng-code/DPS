@@ -212,10 +212,6 @@ class ContainerManager(jobManagerFactory: ActorRefFactory => ActorRef,
 
   private val warmedContainerStates = TrieMap[String, Boolean]() // Key: 容器id containerId, Value: true if in use, false if idle
 
-  // 记录收到请求的时间
-  private val requestTimes = new ConcurrentHashMap[String, Long]()
-  // 记录调度时间的文件路径
-  private val scheduleTimePath = "/db/schedule_time.csv"
   
   private val creationJobManager = jobManagerFactory(context)
 
@@ -231,51 +227,10 @@ class ContainerManager(jobManagerFactory: ActorRefFactory => ActorRef,
   private val invokerKey = InvokerKeys.prefix
   private val watcherName = s"container-manager"
 
-  // 确保调度时间的文件存在
-  private def ensureScheduleTimeFileExists()(implicit logging: Logging): Unit = {
-    logging.info(this, "正在初始化调度时间记录文件")
-    val file = new File(scheduleTimePath)
-    val dir = file.getParentFile
-    if (!dir.exists()) {
-      dir.mkdirs()
-    }
-    
-    // 如果文件存在就删除并新建一个空的
-    if (file.exists()) {
-      try {
-        file.delete()
-        logging.info(this, s"成功删除已存在的调度时间记录文件: ${file.getAbsolutePath}")
-      } catch {
-        case e: Exception =>
-          logging.error(this, s"删除已存在的调度时间记录文件失败: ${e.getMessage}")
-          return // 如果删除失败则直接返回，不继续创建新文件
-      }
-    }
 
-    // 创建新文件
-    try {
-      file.createNewFile()
-      logging.info(this, s"成功创建调度时间记录文件: ${file.getAbsolutePath}")
-    } catch {
-      case e: Exception => 
-        logging.error(this, s"创建调度时间记录文件失败: ${e.getMessage}")
-    }
-  }
 
-  // 将调度时间追加到日志文件
-  private def appendToLogFile(creationId: String, schedulingTimeMs: Long)(implicit logging: Logging): Unit = {
-    val writer = new PrintWriter(new FileWriter(scheduleTimePath, true))
-    if (schedulingTimeMs > 1000){
-      logging.error(this, s"调度耗时过长！！！")
-    }
-    try {
-      // 每行记录格式：creationId|调度时间
-      writer.println(s"$creationId|$schedulingTimeMs")
-      writer.flush()
-    } finally {
-      writer.close()
-    }
-  }
+
+
 
   
   // 尝试重新调度等待态msg
@@ -505,13 +460,6 @@ class ContainerManager(jobManagerFactory: ActorRefFactory => ActorRef,
     implicit logging: Logging): Future[Unit] = {
     // 改为Future[Unit]
 
-    // 记录收到请求的时间
-    val currentTimeMs = System.currentTimeMillis()
-    msgs.foreach { msg =>
-      requestTimes.put(msg.creationId.asString, currentTimeMs)
-      logging.warn(this, s"请求creationId: ${msg.creationId.asString} , 时间 $currentTimeMs")
-    }
-
     // logging.info(this, s"received ${msgs.size} creation message [${msgs.head.invocationNamespace}:${msgs.head.action}]")
     // 获取当前可用的 Invokers
     ContainerManager
@@ -641,20 +589,20 @@ class ContainerManager(jobManagerFactory: ActorRefFactory => ActorRef,
           }
         }
       }
-      .map { _ => // 添加一个map操作来获取调度时间并记录
-        msgs.foreach { msg =>
-          val requestId = msg.creationId.asString
-          if (requestTimes.containsKey(requestId)) {
-            val receiveTime = requestTimes.remove(requestId)
-            val currentTimeMs = System.currentTimeMillis()
-            val schedulingTimeMs = currentTimeMs - receiveTime
-            logging.warn(this, s"请求creationId: ${msg.creationId.asString} 调度完成, 时间 $currentTimeMs, 耗时${schedulingTimeMs}ms")
+      // .map { _ => // 添加一个map操作来获取调度时间并记录
+      //   msgs.foreach { msg =>
+      //     val requestId = msg.creationId.asString
+      //     if (ContainerManager.requestTimes.containsKey(requestId)) {
+      //       val receiveTime = ContainerManager.requestTimes.remove(requestId)
+      //       val currentTimeMs = System.currentTimeMillis()
+      //       val schedulingTimeMs = currentTimeMs - receiveTime
+      //       logging.warn(this, s"请求creationId: ${msg.creationId.asString} 调度完成, 时间 $currentTimeMs, 耗时${schedulingTimeMs}ms")
             
-            // 将调度时间写入文件，传递creationId和调度时间
-            appendToLogFile(requestId, schedulingTimeMs)
-          }
-        }
-      }
+      //       // 将调度时间写入文件，传递creationId和调度时间
+      //       appendToLogFile(requestId, schedulingTimeMs)
+      //     }
+      //   }
+      // }
 
   }
 
@@ -759,6 +707,37 @@ class ContainerManager(jobManagerFactory: ActorRefFactory => ActorRef,
     }
   }
 
+  // 确保调度时间的文件存在
+  private def ensureScheduleTimeFileExists()(implicit logging: Logging): Unit = {
+    logging.info(this, "正在初始化调度时间记录文件")
+    val file = new File("/db/schedule_time.csv")
+    val dir = file.getParentFile
+    if (!dir.exists()) {
+      dir.mkdirs()
+    }
+    
+    // 如果文件存在就删除并新建一个空的
+    if (file.exists()) {
+      try {
+        file.delete()
+        logging.info(this, s"成功删除已存在的调度时间记录文件: ${file.getAbsolutePath}")
+      } catch {
+        case e: Exception =>
+          logging.error(this, s"删除已存在的调度时间记录文件失败: ${e.getMessage}")
+          return // 如果删除失败则直接返回，不继续创建新文件
+      }
+    }
+
+    // 创建新文件
+    try {
+      file.createNewFile()
+      logging.info(this, s"成功创建调度时间记录文件: ${file.getAbsolutePath}")
+    } catch {
+      case e: Exception => 
+        logging.error(this, s"创建调度时间记录文件失败: ${e.getMessage}")
+    }
+  }
+
   // warm up all invokers
   private def warmUp() = {
     // warm up exist invokers
@@ -792,6 +771,9 @@ object ContainerManager {
 
   private val managedFraction: Double = Math.max(0.0, Math.min(1.0, fractionConfig.managedFraction))
   private val blackboxFraction: Double = Math.max(1.0 - managedFraction, Math.min(1.0, fractionConfig.blackboxFraction))
+
+  // 记录收到请求的时间
+  val requestTimes = new ConcurrentHashMap[String, Long]()
 
     // 读取文件内容的函数（适用于 Scala 2.12 及以下版本）
   def readSqlFromFile(filePath: String)(implicit logging: Logging): Option[String] = {
@@ -927,7 +909,23 @@ object ContainerManager {
         TimePredictor.addWaitingContainerIds(containerId)
       }
     }
+  
 
+
+  // 将调度时间追加到日志文件
+  def appendToLogFile(creationId: String, schedulingTimeMs: Long)(implicit logging: Logging): Unit = {
+    val writer = new PrintWriter(new FileWriter("/db/schedule_time.csv", true))
+    if (schedulingTimeMs > 1000){
+      logging.error(this, s"调度耗时过长！！！")
+    }
+    try {
+      // 每行记录格式：creationId|调度时间
+      writer.println(s"$creationId|$schedulingTimeMs")
+      writer.flush()
+    } finally {
+      writer.close()
+    }
+  }
     
     msgs.foreach { msg =>
       val isPrewarm = msg.args.exists(_.fields.get("db_file").exists(_.convertTo[String] == "prewarm"))
@@ -970,9 +968,15 @@ object ContainerManager {
         }
 
         // 选择等待时间最短的策略，包括冷启动、warm 容器和 working 容器的等待时间
-        logging.warn(this, s"为 msg creationId: ${msg.creationId.asString} 选择最佳策略...")
+        logging.warn(this, s"${System.currentTimeMillis()}-为 msg creationId: ${msg.creationId.asString} 选择最佳策略...")
+        requestTimes.put(msg.creationId.asString, System.currentTimeMillis())
         val optimalStrategy = TimePredictor.predictWaitTimeAndGetOptimal(msg.creationId.asString, tablesNeeded, waitingAWarmContainer)
         logging.error(this, s"${msg.creationId.asString} 选择最佳策略为 $optimalStrategy")
+        val receiveTime = requestTimes.remove(msg.creationId.asString)
+        val currentTimeMs = System.currentTimeMillis()
+        val schedulingTimeMs = currentTimeMs - receiveTime
+        logging.error(this, s"请求creationId: ${msg.creationId.asString} 调度完成, 时间 $currentTimeMs, 耗时${schedulingTimeMs}ms")
+        appendToLogFile(msg.creationId.asString, schedulingTimeMs)    
 
         // optimalStrategy match {
         //   case ("coldStart", _, _) =>
