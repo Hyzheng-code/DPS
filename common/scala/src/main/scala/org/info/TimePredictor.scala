@@ -269,20 +269,15 @@ object TimePredictor {
    * @return 缺失表的下载总时间，单位为秒
    */
   def predictDownloadTime(neededTables: List[String], existingTables: List[String], containerId: String = "coldStart")(implicit logging: Logging): Double = {
-    // 使用缓存的带宽计算
+    logging.warn(this, s"${System.currentTimeMillis()}-正在计算带宽")
     val bandwidthBps: Long = if (containerId == "coldStart") {
       getAverageBandwidth()
     } else {
       ContainerDbInfoManager.dbSizeGrowthRateMap.getOrElse(containerId, getAverageBandwidth().toDouble).toLong
     }
     
-    // 找出缺失的表
     val missingTables = neededTables.diff(existingTables)
-    
-    // 计算缺失表的总大小（字节）
     val totalSizeBytes = missingTables.flatMap(TargetBenchmark.get).sum
-
-    // 计算并返回下载时间（秒）
     totalSizeBytes.toDouble / bandwidthBps
   }
 
@@ -316,20 +311,22 @@ object TimePredictor {
     // 如果不存在，会直接返回None
   }
 
-  def predictWaitTimeAndGetOptimal(creationId: String, tablesNeeded: List[String], waitingAWarmContainer: Boolean = false)(implicit logging: Logging): (String, Double, Boolean) = synchronized {
-    logging.info(this, s"正在为creationId: $creationId 选择最佳容器")
+def predictWaitTimeAndGetOptimal(creationId: String, tablesNeeded: List[String], waitingAWarmContainer: Boolean = false)(implicit logging: Logging): (String, Double, Boolean) = synchronized {
+    logging.warn(this, s"${System.currentTimeMillis()}-正在为creationId: $creationId 选择最佳容器")
     val coldStartDownloadTime = predictDownloadTime(tablesNeeded, List.empty[String])
     val coldStartTotalTime = coldStartDownloadTime + coldStartContainerInitTime
     logging.info(this, s"Predicted total wait time for cold start: $coldStartTotalTime = coldStartDownloadTime: $coldStartDownloadTime + coldStartContainerInitTime: $coldStartContainerInitTime")
-
+    logging.warn(this, s"${System.currentTimeMillis()}-冷启动时间计算完成")
+    
     // 如果 creationId 已经在 waitingCreationIdToContainerIds 中，说明该请求已经在等待某个已返回的热容器，将这个热容器变为可用
     waitingCreationIdToContainerIds.remove(creationId).foreach { containerId =>
       removeWaitingContainerIds(containerId)
     }
 
     val containerWaitTimes = predictWaitTime(tablesNeeded, waitingAWarmContainer)
+    logging.warn(this, s"${System.currentTimeMillis()}-容器等待时间预测完成")
     val dbInfo = ContainerDbInfoManager.getDbInfo()
-    
+
     // 构建候选策略列表，包括冷启动的总时间
     val candidateStrategies = if (waitingAWarmContainer) {
       containerWaitTimes.map { case (id, time, isWarm) => (id, time, isWarm) }
@@ -337,33 +334,37 @@ object TimePredictor {
       containerWaitTimes.map { case (id, time, isWarm) => (id, time, isWarm) } :+ (("coldStart", coldStartTotalTime, false))
     }
     logging.info(this, s"Candidate strategies (containerId, totalTime): $candidateStrategies")
+    logging.warn(this, s"${System.currentTimeMillis()}-候选策略构建完成")
 
-    val filteredStrategies = candidateStrategies.filterNot { case (id, _, _) => 
-      // 过滤掉冷启动策略
-      id == "coldStart" ||
-      // 过滤掉预热状态的容器
-      containerWaitTimes.exists { case (containerId, _, _) => 
-        containerId == id && dbInfo.get(containerId).exists(_.state == "prewarm")
-      }
-    }
-  
-    logging.info(this, s"Filtered strategies (containerId, totalTime): $filteredStrategies")
+    // 注意：注释掉了冷启动过滤逻辑
+    // val filteredStrategies = candidateStrategies.filterNot { case (id, _, _) => 
+    //   // 过滤掉冷启动策略
+    //   id == "coldStart" ||
+    //   // 过滤掉预热状态的容器
+    //   containerWaitTimes.exists { case (containerId, _, _) => 
+    //     containerId == id && dbInfo.get(containerId).exists(_.state == "prewarm")
+    //   }
+    // }
+    // logging.info(this, s"Filtered strategies (containerId, totalTime): $filteredStrategies")
 
     // 如果过滤后还有其他选择（warm或working容器），就使用这些优选策略；否则考虑所有选项
-    val strategiesToConsider = if (filteredStrategies.nonEmpty) filteredStrategies else candidateStrategies
+    // val strategiesToConsider = if (filteredStrategies.nonEmpty) filteredStrategies else candidateStrategies
+    val strategiesToConsider = candidateStrategies
 
     // 选择等待时间最短的策略，包括冷启动、warm 容器和 working 容器的等待时间
     if (strategiesToConsider.isEmpty) {
-      logging.error(this, s"waitingAWarmContainer: $waitingAWarmContainer , 但是选择了冷启动! No available strategies found! containerWaitTimes: $containerWaitTimes, candidateStrategies: $candidateStrategies, filteredStrategies: $filteredStrategies")
+      // logging.error(this, s"waitingAWarmContainer: $waitingAWarmContainer , 但是选择了冷启动! No available strategies found! containerWaitTimes: $containerWaitTimes, candidateStrategies: $candidateStrategies, filteredStrategies: $filteredStrategies")
       ("coldStart", coldStartTotalTime, false)
     } else {
+      // strategiesToConsider.minBy { case (_, totalTime, _) => totalTime }
       // 找出最短等待时间
       val minWaitTime = strategiesToConsider.map(_._2).min
       
       // 筛选出所有具有最短等待时间的容器
       val shortestWaitTimeStrategies = strategiesToConsider.filter(_._2 == minWaitTime)
+      logging.warn(this, s"${System.currentTimeMillis()}-最短等待时间筛选完成")
       
-      // 优化的策略选择：一次遍历完成所有逻辑
+      // 优化：一次性获取所有需要的信息并选择最佳策略
       val selectedStrategy = {
         var bestStrategy: (String, Double, Boolean) = shortestWaitTimeStrategies.head
         var bestIsWarm = false
@@ -390,11 +391,14 @@ object TimePredictor {
         bestStrategy
       }
 
+      logging.warn(this, s"${System.currentTimeMillis()}-最佳策略选择完成")
+
       // 如果选择了warm容器，立即更新状态为locked
       selectedStrategy match {
         case (containerId, time, true) => 
-          ContainerDbInfoManager.updateStateToLocked(containerId)
-          logging.info(this, s"热容器 $containerId 被选中并立即锁定")
+          // ContainerDbInfoManager.updateStateToLocked(containerId)
+          // logging.info(this, s"热容器 $containerId 被选中并立即锁定")
+          logging.info(this, s"热容器 $containerId 被选中")
           // 如果选择了warm容器，计算总waiting时间（如果有）
           calculateAndCleanWaitingTime(creationId)
           
@@ -415,11 +419,12 @@ object TimePredictor {
   }
 
   // 给newWaitingContainerIds一个默认值，使得当非调度器调用时，可以使用TimePredictor自己持有的值计算更新
-  def predictWaitTime(tablesNeeded: List[String], waitingAWarmContainer: Boolean = false)(implicit logging: Logging): Seq[(String, Double, Boolean)] = synchronized {
+def predictWaitTime(tablesNeeded: List[String], waitingAWarmContainer: Boolean = false)(implicit logging: Logging): Seq[(String, Double, Boolean)] = synchronized {
+    logging.warn(this, s"${System.currentTimeMillis()}-正在过滤容器")
     logging.info(this, s"waitingAWarmContainer: $waitingAWarmContainer")
     val dbInfo = ContainerDbInfoManager.getDbInfo()
     
-    // 前置过滤：一次性过滤出符合条件的容器
+    // 前置过滤容器
     val filteredDbInfo = dbInfo.filter { case (containerId, info) =>
       // 条件1：跳过正在被等待的容器
       !waitingContainerIds.contains(containerId) &&
@@ -430,13 +435,13 @@ object TimePredictor {
       // 条件4：working状态仅在非等待已返回容器时考虑
       (info.state == "working" && !waitingAWarmContainer) ||
       // 条件5：loading状态需要非等待已返回容器且有有效containerId
-      (info.state == "loading" && !waitingAWarmContainer && containerId.length == 64) ||
-      // 条件6：prewarm状态
-      (info.state == "prewarm"))
+      (info.state == "loading" && !waitingAWarmContainer))
     }
-
-    // 遍历过滤后的容器
-    val containerWaitTimes = filteredDbInfo.flatMap {
+    
+    logging.warn(this, s"${System.currentTimeMillis()}-过滤前容器数: ${dbInfo.size}, 过滤后容器数: ${filteredDbInfo.size}")
+    
+    // 并行计算容器等待时间
+    val containerWaitTimes = filteredDbInfo.toSeq.par.flatMap {
       case (containerId, info) =>
         info.state match {
           case "warm" =>
@@ -471,13 +476,6 @@ object TimePredictor {
               logging.error(this, s"Missing data for container $containerId. dbInfo: $info.")
               None
             }
-
-          case "prewarm" =>
-            // 对于预热状态的容器，设置一个略低于冷启动的时间
-            val existingTables = info.tables
-            val prewarmDownloadTime = predictDownloadTime(tablesNeeded, existingTables, containerId)
-            val prewarmWaitTime = (coldStartContainerInitTime - 1) + prewarmDownloadTime
-            Some((containerId, prewarmWaitTime, false))
 
           case "loading" =>
             val existingTables = info.tables
@@ -543,7 +541,7 @@ object TimePredictor {
           case _ =>
             None
         }
-    }.toSeq
+    }.seq.toSeq
     
     containerWaitTimes
   }
