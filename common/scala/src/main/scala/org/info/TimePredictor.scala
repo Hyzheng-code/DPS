@@ -17,6 +17,24 @@ object TimePredictor {
   // List("warm", "prewarm") // 只有冷热启动
   // List("warm", "working", "loading", "prewarm") // 完全wait
 
+  // 缓存平均带宽
+  @volatile private var cachedAverageBandwidth: Option[Long] = None
+  private var lastBandwidthCalculationTime: Long = 0
+  private val bandwidthCacheValidityMs = 1000 // 1秒缓存
+
+  private def getAverageBandwidth(): Long = {
+    val now = System.currentTimeMillis()
+    if (cachedAverageBandwidth.isEmpty || (now - lastBandwidthCalculationTime) > bandwidthCacheValidityMs) {
+      val bandwidth = if (ContainerDbInfoManager.dbSizeGrowthRateMap.isEmpty) {
+        defaultBandwidthBps
+      } else {
+        (ContainerDbInfoManager.dbSizeGrowthRateMap.values.sum / ContainerDbInfoManager.dbSizeGrowthRateMap.size).toLong
+      }
+      cachedAverageBandwidth = Some(math.max(bandwidth, defaultBandwidthBps))
+      lastBandwidthCalculationTime = now
+    }
+    cachedAverageBandwidth.get
+  }
 
   // 记录activationId和creationId的对应关系
   private val creationIdToActivationIdMap = TrieMap[String, String]()
@@ -261,29 +279,18 @@ object TimePredictor {
     // logging.info(this, s"容器 $containerId 的带宽为 $bandwidthBps Byte/s")
 
     // val bandwidthBps: Long = (ContainerDbInfoManager.dbSizeGrowthRateMap.values.sum / ContainerDbInfoManager.dbSizeGrowthRateMap.size).toLong
-
-    logging.warn(this, s"${System.currentTimeMillis()}-正在计算带宽")
-    val bandwidthBps: Long = {
-      val calculatedBandwidth = if (ContainerDbInfoManager.dbSizeGrowthRateMap.isEmpty) {
-        TimePredictor.defaultBandwidthBps
-      } else {
-        (ContainerDbInfoManager.dbSizeGrowthRateMap.values.sum / ContainerDbInfoManager.dbSizeGrowthRateMap.size).toLong
-      }
-      // 确保带宽至少有一个最小值
-      math.max(calculatedBandwidth, TimePredictor.defaultBandwidthBps)
-    }
-
-    // logging.warn(this, s"${System.currentTimeMillis()}-正在计算缺失表")
-    // 找出缺失的表
-    val missingTables = neededTables.diff(existingTables)
     
-    // logging.warn(this, s"${System.currentTimeMillis()}-正在计算缺失表总大小")
-    // 计算缺失表的总大小（字节），并转换为bit
+    logging.warn(this, s"${System.currentTimeMillis()}-正在计算带宽")
+    val bandwidthBps: Long = if (containerId == "coldStart") {
+      getAverageBandwidth()
+    } else {
+      ContainerDbInfoManager.dbSizeGrowthRateMap.getOrElse(containerId, getAverageBandwidth().toDouble).toLong
+    }
+    
+    val missingTables = neededTables.diff(existingTables)
     val totalSizeBytes = missingTables.flatMap(TargetBenchmark.get).sum
-
-    // 计算并返回下载时间（秒）
-    // logging.warn(this, s"${System.currentTimeMillis()}-计算预计下载时间完成")
     totalSizeBytes.toDouble / bandwidthBps
+
   }
 
   // 为了兼容更新与查询的功能，需要一个返回值
@@ -321,14 +328,16 @@ object TimePredictor {
     val coldStartDownloadTime = predictDownloadTime(tablesNeeded, List.empty[String])
     val coldStartTotalTime = coldStartDownloadTime + coldStartContainerInitTime
     logging.info(this, s"Predicted total wait time for cold start: $coldStartTotalTime = coldStartDownloadTime: $coldStartDownloadTime + coldStartContainerInitTime: $coldStartContainerInitTime")
-
+    logging.warn(this, s"${System.currentTimeMillis()}-冷启动时间计算完成")
     // 如果 creationId 已经在 waitingCreationIdToContainerIds 中，说明该请求已经在等待某个已返回的热容器，将这个热容器变为可用
     waitingCreationIdToContainerIds.remove(creationId).foreach { containerId =>
       removeWaitingContainerIds(containerId)
     }
 
     val containerWaitTimes = predictWaitTime(tablesNeeded, waitingAWarmContainer)
-    
+    logging.warn(this, s"${System.currentTimeMillis()}-容器等待时间预测完成")
+    val dbInfo = ContainerDbInfoManager.getDbInfo()
+
     // 构建候选策略列表，包括冷启动的总时间
     val candidateStrategies = if (waitingAWarmContainer) {
       containerWaitTimes.map { case (id, time, isWarm) => (id, time, isWarm) }
@@ -336,18 +345,17 @@ object TimePredictor {
       containerWaitTimes.map { case (id, time, isWarm) => (id, time, isWarm) } :+ (("coldStart", coldStartTotalTime, false))
     }
     logging.info(this, s"Candidate strategies (containerId, totalTime): $candidateStrategies")
+    logging.warn(this, s"${System.currentTimeMillis()}-候选策略构建完成")
 
-    val dbInfo = ContainerDbInfoManager.getDbInfo()
-    val filteredStrategies = candidateStrategies.filterNot { case (id, _, _) => 
-      // 过滤掉冷启动策略
-      id == "coldStart" ||
-      // 过滤掉预热状态的容器
-      containerWaitTimes.exists { case (containerId, _, _) => 
-        containerId == id && dbInfo.get(containerId).exists(_.state == "prewarm")
-      }
-    }
-  
-    logging.info(this, s"Filtered strategies (containerId, totalTime): $filteredStrategies")
+    // val filteredStrategies = candidateStrategies.filterNot { case (id, _, _) => 
+    //   // 过滤掉冷启动策略
+    //   id == "coldStart" ||
+    //   // 过滤掉预热状态的容器
+    //   containerWaitTimes.exists { case (containerId, _, _) => 
+    //     containerId == id && dbInfo.get(containerId).exists(_.state == "prewarm")
+    //   }
+    // }
+    // logging.info(this, s"Filtered strategies (containerId, totalTime): $filteredStrategies")
 
     // 如果过滤后还有其他选择（warm或working容器），就使用这些优选策略；否则考虑所有选项
     // val strategiesToConsider = if (filteredStrategies.nonEmpty) filteredStrategies else candidateStrategies
@@ -355,32 +363,45 @@ object TimePredictor {
 
     // 选择等待时间最短的策略，包括冷启动、warm 容器和 working 容器的等待时间
     if (strategiesToConsider.isEmpty) {
-      logging.error(this, s"waitingAWarmContainer: $waitingAWarmContainer , 但是选择了冷启动! No available strategies found! containerWaitTimes: $containerWaitTimes, candidateStrategies: $candidateStrategies, filteredStrategies: $filteredStrategies")
+      // logging.error(this, s"waitingAWarmContainer: $waitingAWarmContainer , 但是选择了冷启动! No available strategies found! containerWaitTimes: $containerWaitTimes, candidateStrategies: $candidateStrategies, filteredStrategies: $filteredStrategies")
       ("coldStart", coldStartTotalTime, false)
     } else {
       // strategiesToConsider.minBy { case (_, totalTime, _) => totalTime }
-        // 找出最短等待时间
+      // 找出最短等待时间
       val minWaitTime = strategiesToConsider.map(_._2).min
       
       // 筛选出所有具有最短等待时间的容器
       val shortestWaitTimeStrategies = strategiesToConsider.filter(_._2 == minWaitTime)
+      logging.warn(this, s"${System.currentTimeMillis()}-最短等待时间筛选完成")
       
-      // 从最短等待时间的容器中筛选出 warm 状态的容器
-      val warmStrategies = shortestWaitTimeStrategies.filter { case (containerId, _, _) =>
-        dbInfo.get(containerId).exists(_.state == "warm")
+      // 优化：一次性获取所有需要的信息并选择最佳策略
+      val selectedStrategy = {
+        var bestStrategy: (String, Double, Boolean) = shortestWaitTimeStrategies.head
+        var bestIsWarm = false
+        var bestTimestamp = 0.0
+        
+        // 一次遍历完成所有逻辑
+        shortestWaitTimeStrategies.foreach { case (containerId, time, isWarm) =>
+          val containerInfo = if (containerId == "coldStart") None else dbInfo.get(containerId)
+          val isWarmState = containerInfo.exists(_.state == "warm")
+          val timestamp = containerInfo.flatMap(_.updateStateTimestamp).getOrElse(0.0)
+          
+          // 选择逻辑：优先warm状态，其次最新时间戳
+          if (isWarmState && !bestIsWarm) {
+            // 当前是warm，之前最佳不是warm
+            bestStrategy = (containerId, time, isWarm)
+            bestIsWarm = true
+            bestTimestamp = timestamp
+          } else if (isWarmState == bestIsWarm && timestamp > bestTimestamp) {
+            // 同样状态下，选择时间戳更新的
+            bestStrategy = (containerId, time, isWarm)
+            bestTimestamp = timestamp
+          }
+        }
+        bestStrategy
       }
 
-      // 选择最终策略，如果有 warm 状态的容器，从中选择时间戳最新的
-      val selectedStrategy = if (warmStrategies.nonEmpty) {
-        warmStrategies.maxBy { case (containerId, _, _) => 
-          dbInfo.get(containerId).flatMap(_.updateStateTimestamp).getOrElse(0.0)
-        }
-      } else {
-        // 如果没有 warm 状态的容器，从所有最短等待时间的容器中选择时间戳最新的
-        shortestWaitTimeStrategies.maxBy { case (containerId, _, _) => 
-          dbInfo.get(containerId).flatMap(_.updateStateTimestamp).getOrElse(0.0)
-        }
-      }
+      logging.warn(this, s"${System.currentTimeMillis()}-最佳策略选择完成")
 
       // 如果选择了warm容器，立即更新状态为locked
       selectedStrategy match {
