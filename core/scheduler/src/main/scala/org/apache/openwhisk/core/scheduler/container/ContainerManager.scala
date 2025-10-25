@@ -327,6 +327,9 @@ class ContainerManager(jobManagerFactory: ActorRefFactory => ActorRef,
   override def receive: Receive = {
     case ContainerCreation(msgs, memory, invocationNamespace) =>
       // logging.info(this, s"receive message ContainerCreation from ${sender()}, msgs:$msgs")
+      msgs.foreach { msg =>
+        ContainerManager.requestTimes.put(msg.creationId.asString, System.currentTimeMillis())
+      }
       logging.info(this, s"receive message ContainerCreation from ${sender()}")
       createContainer(msgs, memory, invocationNamespace)
     case ContainerDeletion(invocationNamespace, fqn, revision, whiskActionMetaData) =>
@@ -459,7 +462,6 @@ class ContainerManager(jobManagerFactory: ActorRefFactory => ActorRef,
   private def createContainer(msgs: List[ContainerCreationMessage], memory: ByteSize, invocationNamespace: String)(
     implicit logging: Logging): Future[Unit] = {
     // 改为Future[Unit]
-
     // logging.info(this, s"received ${msgs.size} creation message [${msgs.head.invocationNamespace}:${msgs.head.action}]")
     // 获取当前可用的 Invokers
     ContainerManager
@@ -969,7 +971,7 @@ object ContainerManager {
 
         // 选择等待时间最短的策略，包括冷启动、warm 容器和 working 容器的等待时间
         logging.warn(this, s"${System.currentTimeMillis()}-为 msg creationId: ${msg.creationId.asString} 选择最佳策略...")
-        requestTimes.put(msg.creationId.asString, System.currentTimeMillis())
+        // requestTimes.put(msg.creationId.asString, System.currentTimeMillis())
         val optimalStrategy = TimePredictor.predictWaitTimeAndGetOptimal(msg.creationId.asString, tablesNeeded, waitingAWarmContainer)
         logging.error(this, s"${msg.creationId.asString} 选择最佳策略为 $optimalStrategy")
         val receiveTime = requestTimes.remove(msg.creationId.asString)

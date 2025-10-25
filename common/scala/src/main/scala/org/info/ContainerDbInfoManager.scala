@@ -169,7 +169,7 @@ object ContainerDbInfoManager {
   private val idleTimeFilePath = "/db/container_idle_times.csv"
 
   private val dbInfoFilePath = "/db/container_db_info.json"
-  private val dbInfoFileExamplePath = "/db/container_db_info_example.json"
+  private val dbInfoFileExamplePath = "/db/container_db_info_example_100.json"
 
   // 内存缓存，初始为空
   @volatile private var cachedDbInfo: Map[String, ContainerDbInfo] = Map.empty

@@ -12,7 +12,7 @@ import java.io.{File, FileWriter, PrintWriter}
 object TimePredictor {
   // 调度器考虑的容器状态列表
   // val ConsideredStates: List[String] = List("warm", "working", "loading", "prewarm")
-  val ConsideredStates: List[String] = List("warm", "working", "loading")
+  val ConsideredStates: List[String] = List("warm", "working", "loading", "prewarm")
   // List() // 只有冷启动
   // List("warm", "prewarm") // 只有冷热启动
   // List("warm", "working", "loading", "prewarm") // 完全wait
@@ -280,7 +280,7 @@ object TimePredictor {
 
     // val bandwidthBps: Long = (ContainerDbInfoManager.dbSizeGrowthRateMap.values.sum / ContainerDbInfoManager.dbSizeGrowthRateMap.size).toLong
     
-    logging.warn(this, s"${System.currentTimeMillis()}-正在计算带宽")
+    // logging.warn(this, s"${System.currentTimeMillis()}-正在计算带宽")
     val bandwidthBps: Long = if (containerId == "coldStart") {
       getAverageBandwidth()
     } else {
@@ -474,11 +474,14 @@ object TimePredictor {
                 (System.currentTimeMillis() / 1000.0) - timestamp
               }
 
-              // 计算 remainingWorkTime，如果有 missing 值则跳过
-              (for {
-                elapsedTime <- elapsedTimeOpt
-                predictWorkingTime <- info.predictWorkingTime
-              } yield {
+              // 计算 remainingWorkTime，如果 updateStateTimestamp 缺失则跳过
+              elapsedTimeOpt.map { elapsedTime =>
+                // 使用默认值1秒，如果 predictWorkingTime 缺失
+                val predictWorkingTime = info.predictWorkingTime.getOrElse {
+                  // logging.warn(this, s"Working 态容器 $containerId 缺失 predictWorkingTime，使用默认值 1.0 秒")
+                  1.0
+                }
+                
                 val timeLeft = predictWorkingTime - elapsedTime
                 // if (timeLeft < - 10000) {
                 //   logging.warn(this, s"Remaining work time for container $containerId is negative: $timeLeft ms.")
@@ -490,10 +493,7 @@ object TimePredictor {
                 // logging.info(this, s"Predicted total wait time for working container $containerId: $workingTotalTime ms")
                 logging.info(this, s"working 态容器: $containerId : 总等待时间($workingTotalTime) = 预计剩余执行时间($predictWorkingTime) + 缺失表加载时间($lackTableDownloadTime) + 容器返回时间($containerReturnTimeCost)")
                 (containerId, workingTotalTime, false)
-              }).orElse {
-              logging.error(this, s"Missing data for container $containerId. dbInfo: $info.")
-              None
-            }
+              }
 
             // case "prewarm" && ConsideredStates.contains(state) =>
             //   // 对于预热状态的容器，设置一个略低于冷启动的时间，实际上不应该是空列表
@@ -560,23 +560,18 @@ object TimePredictor {
               val lackTableDownloadTime = predictDownloadTime(tablesNeeded, existingTables, containerId)
               // logging.info(this, s"loading container: $containerId, tablesNeeded: $tablesNeeded, existingTables: $existingTables, lackTableDownloadTime: $lackTableDownloadTime")
 
-              // 获取并验证 predictWorkingTime
-              val predictWorkingTimeOpt = info.predictWorkingTime
-
-              // 计算 remainingLoadTime 和 totalWaitTime，如果有 missing 值则跳过
-              (for {
-                predictWorkingTime <- predictWorkingTimeOpt
-              } yield {
-                // 计算容器释放的总预测时间
-                val totalWaitTime = remainingLoadTime + predictWorkingTime + lackTableDownloadTime + containerReturnTimeCost
-
-                logging.info(this, s"loading 态容器 $containerId : 总等待时间($totalWaitTime) = 剩余加载时间($remainingLoadTime) + 预计执行时间($predictWorkingTime) + 缺失表加载时间($lackTableDownloadTime) + 容器返回时间($containerReturnTimeCost)")
-
-                (containerId, totalWaitTime, false)
-              }).orElse {
-                logging.error(this, s"Missing data for loading container $containerId. dbInfo: $info.")
-                None
+              // 获取 predictWorkingTime，使用默认值1秒如果缺失
+              val predictWorkingTime = info.predictWorkingTime.getOrElse {
+                // logging.warn(this, s"Loading 态容器 $containerId 缺失 predictWorkingTime，使用默认值 1.0 秒")
+                1.0
               }
+
+              // 计算容器释放的总预测时间
+              val totalWaitTime = remainingLoadTime + predictWorkingTime + lackTableDownloadTime + containerReturnTimeCost
+
+              logging.info(this, s"loading 态容器 $containerId : 总等待时间($totalWaitTime) = 剩余加载时间($remainingLoadTime) + 预计执行时间($predictWorkingTime) + 缺失表加载时间($lackTableDownloadTime) + 容器返回时间($containerReturnTimeCost)")
+
+              Some((containerId, totalWaitTime, false))
 
       case _ =>
         None // 非 warm 或 working 状态的容器跳过 
