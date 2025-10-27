@@ -430,40 +430,51 @@ object TimePredictor {
 
   // 给newWaitingContainerIds一个默认值，使得当非调度器调用时，可以使用TimePredictor自己持有的值计算更新
   def predictWaitTime(tablesNeeded: List[String], waitingAWarmContainer: Boolean = false)(implicit logging: Logging): Seq[(String, Double, Boolean)] = synchronized {
-    // waitingContainerIds = newWaitingContainerIds
-    // 尽量后置dbInfo的读取，防止读到更新前的值
-    logging.warn(this, s"${System.currentTimeMillis()}-正在过滤容器")
-    logging.info(this, s"waitingAWarmContainer: $waitingAWarmContainer")
-    val dbInfo = ContainerDbInfoManager.getDbInfo()
-    // logging.info(this, s"dbInfo contents: $dbInfo")
-    val filteredDbInfo = dbInfo.filter { case (containerId, info) =>
-      // 条件1：跳过正在被等待的容器
-      !waitingContainerIds.contains(containerId) &&
-      // 条件2：只考虑配置允许的状态
-      ConsideredStates.contains(info.state) &&
-      // 条件3：warm状态总是可以考虑
-      (info.state == "warm" ||
-      // 条件4：working状态仅在非等待已返回容器时考虑
-      (info.state == "working" && !waitingAWarmContainer) ||
-      // 条件5：loading状态需要非等待已返回容器且有有效containerId
-      (info.state == "loading" && !waitingAWarmContainer))
+  // 尽量后置dbInfo的读取，防止读到更新前的值
+  logging.warn(this, s"${System.currentTimeMillis()}-正在过滤容器")
+  logging.info(this, s"waitingAWarmContainer: $waitingAWarmContainer")
+  val dbInfo = ContainerDbInfoManager.getDbInfo()
+  
+  val filteredDbInfo = dbInfo.filter { case (containerId, info) =>
+    // 条件1：跳过正在被等待的容器
+    !waitingContainerIds.contains(containerId) &&
+    // 条件2：只考虑配置允许的状态
+    ConsideredStates.contains(info.state) &&
+    // 条件3：warm状态总是可以考虑
+    (info.state == "warm" ||
+    // 条件4：working状态仅在非等待已返回容器时考虑
+    (info.state == "working" && !waitingAWarmContainer) ||
+    // 条件5：loading状态需要非等待已返回容器且有有效containerId
+    (info.state == "loading" && !waitingAWarmContainer))
+  }
+  
+  logging.warn(this, s"${System.currentTimeMillis()}-过滤前容器数: ${dbInfo.size}, 过滤后容器数: ${filteredDbInfo.size}")
+  
+  // ========== 🆕 第一阶段：并行查找精确匹配的warm容器 ==========
+  val exactMatchOpt = filteredDbInfo.toSeq.par
+    .find { case (containerId, info) =>
+      info.state == "warm" && info.tables.toSet == tablesNeeded.toSet
     }
-    // logging.warn(this, s"filteredDbInfo contents: $filteredDbInfo")
-    logging.warn(this, s"${System.currentTimeMillis()}-过滤前容器数: ${dbInfo.size}, 过滤后容器数: ${filteredDbInfo.size}")
-    // 遍历 dbInfo 中的所有容器
-    // val containerWaitTimes = dbInfo.flatMap {
-    val containerWaitTimes = filteredDbInfo.toSeq.par.flatMap {
-      case (containerId, info) =>
-          // logging.info(this, s"inspect container: $containerId, it is $info.state")
+  
+  // 如果找到精确匹配，立即返回
+  val containerWaitTimes = exactMatchOpt match {
+    case Some((containerId, info)) =>
+      logging.info(this, s"🎯 找到精确匹配热容器 $containerId，表集: ${info.tables.sorted.mkString(", ")}")
+      logging.info(this, s"✅ 跳过其他容器评估，直接返回")
+      Seq((containerId, 0.0, true))
+      
+    case None =>
+      // ========== 🆕 第二阶段：没有精确匹配，执行原有的并行评估 ==========
+      logging.info(this, s"未找到精确匹配，进行完整评估")
+      filteredDbInfo.toSeq.par.flatMap {
+        case (containerId, info) =>
           info.state match {
             case "warm" =>
               // 对于 warm 容器，只计算缺失表的下载时间
               val existingTables = info.tables
               val warmDownloadTime = predictDownloadTime(tablesNeeded, existingTables, containerId)
-              // logging.info(this, s"Predicted download time for warm container $containerId: $warmDownloadTime ms")
               Some((containerId, warmDownloadTime, true))
 
-            // 加上if !waitingAWarmContainer，因为如果这个msg等待的容器已返回，则不再为它考虑工作中的容器，避免再次等待，影响公平性
             case "working" =>
               // 对于 working 容器，计算缺失表的下载时间和剩余运行时间
               val existingTables = info.tables
@@ -478,35 +489,19 @@ object TimePredictor {
               elapsedTimeOpt.map { elapsedTime =>
                 // 使用默认值1秒，如果 predictWorkingTime 缺失
                 val predictWorkingTime = info.predictWorkingTime.getOrElse {
-                  // logging.warn(this, s"Working 态容器 $containerId 缺失 predictWorkingTime，使用默认值 1.0 秒")
                   1.0
                 }
                 
                 val timeLeft = predictWorkingTime - elapsedTime
-                // if (timeLeft < - 10000) {
-                //   logging.warn(this, s"Remaining work time for container $containerId is negative: $timeLeft ms.")
-                // }
                 val remainingWorkTime = math.max(timeLeft, 0.0) // 确保剩余时间非负
 
                 // 计算总等待时间并返回
                 val workingTotalTime = lackTableDownloadTime + remainingWorkTime + containerReturnTimeCost
-                // logging.info(this, s"Predicted total wait time for working container $containerId: $workingTotalTime ms")
                 logging.info(this, s"working 态容器: $containerId : 总等待时间($workingTotalTime) = 预计剩余执行时间($predictWorkingTime) + 缺失表加载时间($lackTableDownloadTime) + 容器返回时间($containerReturnTimeCost)")
                 (containerId, workingTotalTime, false)
               }
 
-            // case "prewarm" && ConsideredStates.contains(state) =>
-            //   // 对于预热状态的容器，设置一个略低于冷启动的时间，实际上不应该是空列表
-            //   val existingTables = info.tables
-            //   val prewarmDownloadTime = predictDownloadTime(tablesNeeded, existingTables, containerId)
-
-            //   val prewarmWaitTime = (coldStartContainerInitTime -1) + prewarmDownloadTime
-            //   Some((containerId, prewarmWaitTime, false))
-
-            // 由于loading时间预测不准确，暂时注释掉不考虑
-            // 通过限制containerId的长度来跳过那些刚创建、还没有containerId的条目
             case "loading" =>
-
               val existingTables = info.tables
               val currentTime = Instant.now.getEpochSecond
 
@@ -520,7 +515,7 @@ object TimePredictor {
 
               // 根据 tables 字段计算目标大小
               val targetDbSize = existingTables
-                .map(table => TargetBenchmark.getOrElse(table, 0L)) // 获取表的大小，如果表未定义则默认为 0
+                .map(table => TargetBenchmark.getOrElse(table, 0L))
                 .sum
 
               if (targetDbSize * 1.2 < currentDbSize){
@@ -529,13 +524,7 @@ object TimePredictor {
 
               // 计算还需要加载的大小
               val remainingSize = math.max(targetDbSize - currentDbSize, 0L)
-              // logging.info(this, s"loading container: $containerId, remainingSize: $remainingSize = targetDbSize: $targetDbSize - currentDbSize: $currentDbSize")
 
-              // 获取带宽（带宽的单位为字节每秒）
-              // val bandwidthBps: Long = ContainerDbInfoManager.dbSizeGrowthRateMap
-              //   .get(containerId)
-              //   .map(_.toLong) // 转换为 Long 类型
-              //   .getOrElse((ContainerDbInfoManager.dbSizeGrowthRateMap.values.sum / ContainerDbInfoManager.dbSizeGrowthRateMap.size).toLong)
               // 修改loading状态的带宽计算，添加保护机制
               val bandwidthBps: Long = {
                 val calculatedBandwidth = ContainerDbInfoManager.dbSizeGrowthRateMap
@@ -553,16 +542,13 @@ object TimePredictor {
                 math.max(calculatedBandwidth, TimePredictor.defaultBandwidthBps)
               }
 
-              // logging.info(this, s"loading container: $containerId, bandwidth: $bandwidthBps Byte/s")
               // 计算剩余加载时间（秒）
               val remainingLoadTime = remainingSize.toDouble / bandwidthBps
               logging.info(this, s"loading 态容器 $containerId : 剩余加载时间  $remainingLoadTime = remainingSize: $remainingSize / bandwidthBps: $bandwidthBps")
               val lackTableDownloadTime = predictDownloadTime(tablesNeeded, existingTables, containerId)
-              // logging.info(this, s"loading container: $containerId, tablesNeeded: $tablesNeeded, existingTables: $existingTables, lackTableDownloadTime: $lackTableDownloadTime")
 
               // 获取 predictWorkingTime，使用默认值1秒如果缺失
               val predictWorkingTime = info.predictWorkingTime.getOrElse {
-                // logging.warn(this, s"Loading 态容器 $containerId 缺失 predictWorkingTime，使用默认值 1.0 秒")
                 1.0
               }
 
@@ -573,12 +559,12 @@ object TimePredictor {
 
               Some((containerId, totalWaitTime, false))
 
-      case _ =>
-        None // 非 warm 或 working 状态的容器跳过 
+            case _ =>
+              None
           }
-        
-    // }.toSeq
-    }.seq.toSeq
-    containerWaitTimes
+      }.seq.toSeq
   }
+  
+  containerWaitTimes
+}
 }
